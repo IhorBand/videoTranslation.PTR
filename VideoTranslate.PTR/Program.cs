@@ -3,20 +3,67 @@ using Microsoft.CognitiveServices.Speech.Audio;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Primitives;
+using Newtonsoft.Json;
 using Serilog;
+using System.Net;
 using System.Reflection;
+using System.Text;
 using VideoTranslate.Shared.DTO.Configuration;
 
 namespace VideoTranslate.PTR
 {
     public class Program
     {
-        static string YourSubscriptionKey = "b7998ec252ab4daf95f9e70f81308837";
-        static string YourServiceRegion = "eastus";
+        static string RecognitionSubscriptionKey = "";
+        static string RecognitionServiceRegion = "eastus";
+
+        static readonly string TranslatorKey = "";
+        static readonly string TranslatorEndpoint = "https://api.cognitive.microsofttranslator.com";
+        static readonly string TranslatorLocation = "eastus";
+
+
+        static readonly string SpeechKey = "";
+        static readonly string SpeechLocation = "eastus";
+        static readonly string SpeechVoiceId = "uk-UA-OstapNeural";
+
+        static void OutputSpeechSynthesisResult(SpeechSynthesisResult speechSynthesisResult, string text)
+        {
+            switch (speechSynthesisResult.Reason)
+            {
+                case ResultReason.SynthesizingAudioCompleted:
+                    Console.WriteLine($"Speech synthesized for text: [{text}]");
+                    break;
+                case ResultReason.Canceled:
+                    var cancellation = SpeechSynthesisCancellationDetails.FromResult(speechSynthesisResult);
+                    Console.WriteLine($"CANCELED: Reason={cancellation.Reason}");
+
+                    if (cancellation.Reason == CancellationReason.Error)
+                    {
+                        Console.WriteLine($"CANCELED: ErrorCode={cancellation.ErrorCode}");
+                        Console.WriteLine($"CANCELED: ErrorDetails=[{cancellation.ErrorDetails}]");
+                        Console.WriteLine($"CANCELED: Did you set the speech resource key and region values?");
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        public class TranslatorResultTranslation
+        {
+            public string text { get; set; }
+            public string to { get; set; }
+        }
+
+        public class TranslatorResultJson
+        {
+            public List<TranslatorResultTranslation> translations { get; set; }
+        }
 
         async static Task Main(string[] args)
         {
-            var speechConfig = SpeechConfig.FromSubscription(YourSubscriptionKey, YourServiceRegion);
+            var speechConfig = SpeechConfig.FromSubscription(RecognitionSubscriptionKey, RecognitionServiceRegion);
             speechConfig.SpeechRecognitionLanguage = "en-US";
 
             using var audioConfig = AudioConfig.FromDefaultMicrophoneInput();
@@ -37,6 +84,70 @@ namespace VideoTranslate.PTR
                 if (e.Result.Reason == ResultReason.RecognizedSpeech)
                 {
                     Console.WriteLine($"RECOGNIZED: Text={e.Result.Text}");
+                    // Input and output languages are defined as parameters.
+                    string route = "/translate?api-version=3.0&from=en&to=uk";
+                    object[] body = new object[] { new { Text = e.Result.Text } };
+                    var requestBody = JsonConvert.SerializeObject(body);
+
+                    using (var client = new HttpClient())
+                    using (var request = new HttpRequestMessage())
+                    {
+                        // Build the request.
+                        request.Method = HttpMethod.Post;
+                        request.RequestUri = new Uri(TranslatorEndpoint + route);
+                        request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
+                        request.Headers.Add("Ocp-Apim-Subscription-Key", TranslatorKey);
+                        // location required if you're using a multi-service or regional (not global) resource.
+                        request.Headers.Add("Ocp-Apim-Subscription-Region", TranslatorLocation);
+
+                        // Send the request and get response.
+                        HttpResponseMessage response = client.Send(request);
+                        // Read response as a string.
+                        Stream translatorResultStream = response.Content.ReadAsStream();
+
+                        // convert stream to string
+                        StreamReader reader = new StreamReader(translatorResultStream);
+                        string translatorResult = reader.ReadToEnd();
+                        var translations = JsonConvert.DeserializeObject<List<TranslatorResultJson>>(translatorResult);
+                        if (translations != null && translations.Count > 0 && translations[0] != null && translations[0].translations != null && translations[0].translations.Count > 0)
+                        {
+                            Console.OutputEncoding = Encoding.UTF8;
+                            Console.WriteLine($"Translated: {translations[0].translations[0].text}");
+
+                            var speechConfig = SpeechConfig.FromSubscription(SpeechKey, SpeechLocation);
+
+                            // The language of the voice that speaks.
+                            speechConfig.SpeechSynthesisVoiceName = SpeechVoiceId;
+                            speechConfig.SetSpeechSynthesisOutputFormat(SpeechSynthesisOutputFormat.Raw8Khz16BitMonoPcm);
+
+                            using (var speechSynthesizer = new SpeechSynthesizer(speechConfig))
+                            {
+                                var speakTextTask = speechSynthesizer.SpeakTextAsync(translations[0].translations[0].text);
+                                speakTextTask.Wait();
+                                var speechSynthesisResult = speakTextTask.Result;
+
+                                // Place the data into a stream
+                                using (MemoryStream ms = new MemoryStream(speechSynthesisResult.AudioData))
+                                {
+                                    // Construct the sound player
+                                    var player = new System.Media.SoundPlayer(ms);
+                                    ms.Position = 0;     // Manually rewind stream 
+                                    player.Stream = null;    // Then we have to set stream to null 
+                                    player.Stream = ms;  // And set it again, to force it to be loaded again..
+                                    try
+                                    {
+                                        player.Play();
+                                    }
+                                    catch(Exception ex)
+                                    {
+                                        Console.WriteLine(ex.Message);
+                                    }
+                                }
+
+                                OutputSpeechSynthesisResult(speechSynthesisResult, translations[0].translations[0].text);
+                            }
+                        }
+                    }
                 }
                 else if (e.Result.Reason == ResultReason.NoMatch)
                 {
